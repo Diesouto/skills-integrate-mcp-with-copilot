@@ -5,11 +5,14 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+import json
 import os
 from pathlib import Path
+import secrets
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +21,21 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+with open(current_dir / "teachers.json", encoding="utf-8") as teachers_file:
+    teachers = json.load(teachers_file)["teachers"]
+
+active_sessions = set()
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def require_teacher(request: Request):
+    if request.cookies.get("teacher_session") not in active_sessions:
+        raise HTTPException(status_code=401, detail="Teacher login required")
 
 # In-memory activity database
 activities = {
@@ -88,9 +106,38 @@ def get_activities():
     return activities
 
 
+@app.get("/auth/session")
+def get_session(request: Request):
+    return {"authenticated": request.cookies.get("teacher_session") in active_sessions}
+
+
+@app.post("/auth/login")
+def login(credentials: LoginRequest, response: Response):
+    expected_password = teachers.get(credentials.username)
+    if expected_password is None or not secrets.compare_digest(
+        credentials.password, expected_password
+    ):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    session_token = secrets.token_urlsafe(32)
+    active_sessions.add(session_token)
+    response.set_cookie(
+        key="teacher_session", value=session_token, httponly=True, samesite="lax"
+    )
+    return {"message": "Teacher login successful"}
+
+
+@app.post("/auth/logout")
+def logout(request: Request, response: Response):
+    active_sessions.discard(request.cookies.get("teacher_session"))
+    response.delete_cookie("teacher_session")
+    return {"message": "Logged out"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, request: Request):
     """Sign up a student for an activity"""
+    require_teacher(request)
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +158,9 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, request: Request):
     """Unregister a student from an activity"""
+    require_teacher(request)
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
